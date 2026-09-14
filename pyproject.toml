@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "public-market-monitor"
 version = "0.1.0"
-description = "Paper-only public crypto market monitor"
+description = "Public crypto dashboard with guarded local trading research"
 requires-python = ">=3.11"
 dependencies = ["certifi>=2024", "websocket-client>=1.8"]
 
