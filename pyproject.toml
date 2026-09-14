@@ -11,9 +11,10 @@ dependencies = ["certifi>=2024", "websocket-client>=1.8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+trade = ["coinbase-advanced-py>=1.8.4,<1.9"]
 
 [tool.setuptools]
-py-modules = ["monitor"]
+py-modules = ["monitor", "trader"]
 package-dir = {"" = "src"}
 
 [tool.pytest.ini_options]
