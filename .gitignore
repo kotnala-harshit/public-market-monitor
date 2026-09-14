@@ -6,3 +6,6 @@ data/latest.json
 data/trader-state.json
 data/trader-state.lock
 data/trader-state.tmp
+data/paper-state.json
+data/paper-state.lock
+data/paper-state.tmp

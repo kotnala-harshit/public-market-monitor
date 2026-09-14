@@ -108,6 +108,62 @@ def backtest(
     }
 
 
+def paper_once(
+    rows: list[tuple[int, Decimal, Decimal]],
+    state_path: Path,
+    strategy: str,
+    lookback: int,
+    threshold: Decimal,
+) -> dict:
+    """Persist a forward-only simulation; fill prior close signals at the next open."""
+    with state_path.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        config = {"strategy": strategy, "lookback": lookback, "threshold": str(threshold)}
+        if state and any(state.get(key) != value for key, value in config.items()):
+            raise ValueError("Paper settings changed; start a separate state file")
+        stamp = rows[-1][0]
+        if state and stamp == state["last_candle"]:
+            return state
+        if state and stamp - state["last_candle"] != 3600:
+            raise ValueError("Missed an hourly candle; cannot assume a paper fill")
+        cash = Decimal(state.get("cash_usd", str(CAPITAL)))
+        btc = Decimal(state.get("btc", "0"))
+        trades = state.get("trades", 0)
+        filled_action = "hold"
+        if state:
+            action, price = state["next_action"], rows[-1][1]
+            if (
+                action == "buy"
+                and not btc
+                and cash >= MAX_POSITION * (1 + FEE_AND_SLIPPAGE)
+                and cash >= LOSS_FLOOR
+            ):
+                cash -= MAX_POSITION * (1 + FEE_AND_SLIPPAGE)
+                btc = MAX_POSITION / price
+                filled_action = "buy"
+            elif action == "sell" and btc:
+                cash += btc * price * (1 - FEE_AND_SLIPPAGE)
+                btc = Decimal(0)
+                filled_action = "sell"
+            trades += filled_action != "hold"
+        state = {
+            **config,
+            "last_candle": stamp,
+            "cash_usd": str(cash),
+            "btc": str(btc),
+            "trades": trades,
+            "filled_action": filled_action,
+            "next_action": signal([row[2] for row in rows], lookback, threshold, strategy),
+            "equity_usd": str(
+                (cash + btc * rows[-1][2] * (1 - FEE_AND_SLIPPAGE)).quantize(Decimal("0.01"))
+            ),
+            "note": "Simulated next-open fills are known only after the candle closes; no orders placed",
+        }
+        save_state(state_path, state)
+        return state
+
+
 def as_dict(response) -> dict:
     return response.to_dict() if hasattr(response, "to_dict") else dict(response)
 
@@ -120,6 +176,95 @@ def save_state(path: Path, state: dict) -> None:
         output.flush()
         os.fsync(output.fileno())
     os.replace(temp, path)
+
+
+def reconcile(client, state_path: Path, portfolio_id: str) -> dict:
+    """Resolve a known exchange order without placing or retrying one."""
+    with state_path.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not state_path.exists():
+            raise ValueError("No order state to reconcile")
+        state = json.loads(state_path.read_text())
+        if state.get("portfolio_id") != portfolio_id or state.get("status") not in (
+            "pending",
+            "submitted",
+        ):
+            raise ValueError("No unresolved order for this portfolio")
+        permissions = as_dict(client.get_api_key_permissions())
+        if permissions.get("portfolio_uuid") != portfolio_id or permissions.get("can_transfer"):
+            raise ValueError(
+                "Use a view-only key for the specified portfolio without transfer permission"
+            )
+        if state["status"] == "pending":
+            if not state.get("side") or not state.get("client_order_id"):
+                raise ValueError("Legacy pending state needs manual exchange reconciliation")
+            cursor = None
+            match = None
+            for _ in range(10):
+                page = as_dict(
+                    client.list_orders(
+                        product_ids=[PRODUCT],
+                        start_date=datetime.fromtimestamp(state["last_candle"], UTC).isoformat(),
+                        limit=100,
+                        **({"cursor": cursor} if cursor else {}),
+                    )
+                )
+                if "orders" not in page:
+                    raise ValueError("Incomplete order history; state remains unresolved")
+                found = [
+                    order
+                    for order in page["orders"]
+                    if order.get("client_order_id") == state["client_order_id"]
+                ]
+                if len(found) > 1 or (match and found):
+                    raise ValueError("Multiple orders share the client ID; reconcile manually")
+                if found:
+                    match = found[0]
+                if not page.get("has_next"):
+                    break
+                cursor = page.get("cursor")
+                if not cursor:
+                    raise ValueError("Order history lacks a pagination cursor")
+            else:
+                raise ValueError("Order history exceeded 1,000 entries; reconcile manually")
+            if not match or not match.get("order_id"):
+                raise ValueError("Order not found; state remains unresolved")
+            order_id = match["order_id"]
+        else:
+            order_id = state["order_id"]
+        order = as_dict(client.get_order(order_id))["order"]
+        if (
+            order.get("order_id") != order_id
+            or order.get("product_id") != PRODUCT
+            or order.get("side") != state["side"].upper()
+            or (
+                state.get("client_order_id")
+                and order.get("client_order_id") != state["client_order_id"]
+            )
+        ):
+            raise ValueError("Order details differ from saved attempt; reconcile manually")
+        if order.get("status") != "FILLED":
+            raise ValueError("Order is not filled; state remains unresolved")
+        filled = Decimal(order["filled_size"])
+        owned = Decimal(state.get("owned_btc", "0"))
+        if not filled.is_finite() or filled <= 0 or not owned.is_finite() or owned < 0:
+            raise ValueError("Invalid fill or ownership quantity")
+        if state["side"] == "buy":
+            price = Decimal(order["average_filled_price"])
+            if (
+                not price.is_finite()
+                or price <= 0
+                or filled * price > MAX_POSITION * Decimal("1.01")
+            ):
+                raise ValueError("Filled buy exceeds configured position limit")
+            owned += filled
+        elif state["side"] == "sell" and filled <= owned:
+            owned -= filled
+        else:
+            raise ValueError("Filled sell exceeds bot-owned BTC")
+        state.update(status="ready", owned_btc=str(owned), order_id=order_id)
+        save_state(state_path, state)
+        return {"status": "ready", "order_id": order_id, "owned_btc": str(owned)}
 
 
 def live_once(
@@ -141,16 +286,9 @@ def live_once(
         if state and state.get("portfolio_id") != portfolio_id:
             raise ValueError("State belongs to another portfolio")
         if state.get("status") == "pending":
-            raise ValueError("Previous order outcome unknown; reconcile manually before retrying")
+            raise ValueError("Previous order outcome unknown; run reconcile before retrying")
         if state.get("status") == "submitted":
-            order = as_dict(client.get_order(state["order_id"]))["order"]
-            if order["status"] != "FILLED":
-                raise ValueError("Previous order not filled; reconcile manually before retrying")
-            state["owned_btc"] = (
-                str(Decimal(order["filled_size"])) if state["side"] == "buy" else "0"
-            )
-            state["status"] = "ready"
-            save_state(state_path, state)
+            raise ValueError("Previous order needs reconciliation before another run")
         stamp = rows[-1][0]
         if state.get("last_candle") == stamp:
             return {"action": "hold", "reason": "Already processed this candle"}
@@ -217,6 +355,8 @@ def live_once(
                 "Starting portfolio already holds BTC; move it out before first live run"
             )
         owned = Decimal(state.get("owned_btc", "0"))
+        if btc + Decimal(product["base_increment"]) < owned:
+            raise ValueError("Bot-owned BTC is missing from the portfolio; reconcile manually")
         if btc > owned + Decimal(product["base_increment"]):
             raise ValueError("Portfolio contains BTC not acquired by this bot; refusing to sell it")
         action = signal([r[2] for r in rows], lookback, threshold, strategy)
@@ -275,6 +415,7 @@ def live_once(
                 "last_candle": stamp,
                 "status": "pending",
                 "client_order_id": order_id,
+                "side": action,
                 "owned_btc": str(owned),
             },
         )
@@ -294,6 +435,7 @@ def live_once(
                 "last_candle": stamp,
                 "status": "submitted",
                 "order_id": result["success_response"]["order_id"],
+                "client_order_id": order_id,
                 "side": action,
                 "owned_btc": str(owned),
             },
@@ -309,7 +451,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="BTC-USD spot research and guarded one-shot trading"
     )
-    parser.add_argument("mode", choices=("backtest", "plan", "live"))
+    parser.add_argument("mode", choices=("backtest", "plan", "paper", "reconcile", "live"))
     parser.add_argument("--strategy", choices=("momentum", "reversion"), default="momentum")
     parser.add_argument(
         "--lookback", type=int, default=25, help="Hourly closes, 25 means a 24-hour comparison"
@@ -320,7 +462,7 @@ def main() -> None:
     parser.add_argument(
         "--portfolio-id", help="Dedicated Coinbase Advanced portfolio UUID, required for live mode"
     )
-    parser.add_argument("--state", type=Path, default=Path("data/trader-state.json"))
+    parser.add_argument("--state", type=Path, help="Persistent local state file")
     parser.add_argument(
         "--execute", action="store_true", help="Explicitly enable real orders in live mode"
     )
@@ -331,7 +473,10 @@ def main() -> None:
         not args.execute or os.getenv("LIVE_TRADING_ENABLED") != "YES" or not args.portfolio_id
     ):
         parser.error("Live mode requires --execute, --portfolio-id and LIVE_TRADING_ENABLED=YES")
-    rows = candles(90 if args.mode == "backtest" else 3)
+    args.state = args.state or Path(
+        "data/paper-state.json" if args.mode == "paper" else "data/trader-state.json"
+    )
+    rows = candles(90 if args.mode == "backtest" else 3) if args.mode != "reconcile" else []
     if args.mode == "backtest":
         split = len(rows) * 2 // 3
         print(
@@ -352,6 +497,13 @@ def main() -> None:
                 indent=2,
             )
         )
+    elif args.mode == "paper":
+        args.state.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            json.dumps(
+                paper_once(rows, args.state, args.strategy, args.lookback, args.threshold), indent=2
+            )
+        )
     elif args.mode == "plan":
         print(
             json.dumps(
@@ -370,6 +522,8 @@ def main() -> None:
     else:
         from coinbase.rest import RESTClient
 
+        if not args.portfolio_id:
+            parser.error("Reconcile and live modes require --portfolio-id")
         key, secret = os.getenv("COINBASE_API_KEY"), os.getenv("COINBASE_API_SECRET")
         if not key or not secret:
             parser.error("Set COINBASE_API_KEY and COINBASE_API_SECRET outside the repository")
@@ -377,7 +531,9 @@ def main() -> None:
         client = RESTClient(api_key=key, api_secret=secret.replace("\\n", "\n"), timeout=15)
         print(
             json.dumps(
-                live_once(
+                reconcile(client, args.state, args.portfolio_id)
+                if args.mode == "reconcile"
+                else live_once(
                     client,
                     rows,
                     args.state,
